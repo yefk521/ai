@@ -312,7 +312,7 @@ class StableDiffusionProcessing:
         self.all_prompts = [shared.prompt_styles.apply_styles_to_prompt(x, self.styles) for x in self.all_prompts]
         self.all_negative_prompts = [shared.prompt_styles.apply_negative_styles_to_prompt(x, self.styles) for x in self.all_negative_prompts]
 
-    def get_conds_with_caching(self, function, required_prompts, steps, cache, extra_network_data):
+    def get_conds_with_caching(self, function, required_prompts, steps, caches, extra_network_data):
         """
         Returns the result of calling function(shared.sd_model, required_prompts, steps)
         using a cache to store the result if the same arguments have been used before.
@@ -321,9 +321,15 @@ class StableDiffusionProcessing:
         representing the previously used arguments, or None if no arguments
         have been used before. The second element is where the previously
         computed result is stored.
+
+        caches is a list with items described above.
         """
-        if cache[0] is not None and (required_prompts, steps, opts.CLIP_stop_at_last_layers, shared.sd_model.sd_checkpoint_info, extra_network_data) == cache[0]:
-            return cache[1]
+
+        for cache in caches:
+            if cache[0] is not None and (required_prompts, steps, opts.CLIP_stop_at_last_layers, shared.sd_model.sd_checkpoint_info, extra_network_data) == cache[0]:
+                return cache[1]
+
+        cache = caches[0]
 
         with devices.autocast():
             cache[1] = function(shared.sd_model, required_prompts, steps)
@@ -335,8 +341,8 @@ class StableDiffusionProcessing:
         sampler_config = sd_samplers.find_sampler_config(self.sampler_name)
         self.step_multiplier = 2 if sampler_config and sampler_config.options.get("second_order", False) else 1
 
-        self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, self.negative_prompts, self.steps * self.step_multiplier, self.cached_uc, self.extra_network_data)
-        self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, self.prompts, self.steps * self.step_multiplier, self.cached_c, self.extra_network_data)
+        self.uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, self.negative_prompts, self.steps * self.step_multiplier, [self.cached_uc], self.extra_network_data)
+        self.c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, self.prompts, self.steps * self.step_multiplier, [self.cached_c], self.extra_network_data)
 
     def parse_extra_network_prompts(self):
         self.prompts, self.extra_network_data = extra_networks.parse_prompts(self.prompts)
@@ -739,7 +745,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
             del samples_ddim
 
-            if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
+            if lowvram.is_enabled(shared.sd_model):
                 lowvram.send_everything_to_cpu()
 
             devices.torch_gc()
@@ -894,6 +900,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.hr_negative_prompts = None
         self.hr_extra_network_data = None
 
+        self.cached_hr_uc = [None, None]
+        self.cached_hr_c = [None, None]
         self.hr_c = None
         self.hr_uc = None
 
@@ -973,7 +981,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         latent_scale_mode = shared.latent_upscale_modes.get(self.hr_upscaler, None) if self.hr_upscaler is not None else shared.latent_upscale_modes.get(shared.latent_upscale_default_mode, "nearest")
         if self.enable_hr and latent_scale_mode is None:
-            assert len([x for x in shared.sd_upscalers if x.name == self.hr_upscaler]) > 0, f"could not find upscaler named {self.hr_upscaler}"
+            if not any(x.name == self.hr_upscaler for x in shared.sd_upscalers):
+                raise Exception(f"could not find upscaler named {self.hr_upscaler}")
 
         x = create_random_tensors([opt_C, self.height // opt_f, self.width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
         samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x))
@@ -1056,6 +1065,9 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             with devices.autocast():
                 extra_networks.activate(self, self.hr_extra_network_data)
 
+        with devices.autocast():
+            self.calculate_hr_conds()
+
         sd_models.apply_token_merging(self.sd_model, self.get_token_merging_ratio(for_hr=True))
 
         samples = self.sampler.sample_img2img(self, samples, noise, self.hr_c, self.hr_uc, steps=self.hr_second_pass_steps or self.steps, image_conditioning=image_conditioning)
@@ -1067,6 +1079,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         return samples
 
     def close(self):
+        self.cached_hr_uc = [None, None]
+        self.cached_hr_c = [None, None]
         self.hr_c = None
         self.hr_uc = None
 
@@ -1095,12 +1109,31 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
         self.all_hr_prompts = [shared.prompt_styles.apply_styles_to_prompt(x, self.styles) for x in self.all_hr_prompts]
         self.all_hr_negative_prompts = [shared.prompt_styles.apply_negative_styles_to_prompt(x, self.styles) for x in self.all_hr_negative_prompts]
 
+    def calculate_hr_conds(self):
+        if self.hr_c is not None:
+            return
+
+        self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, self.hr_negative_prompts, self.steps * self.step_multiplier, [self.cached_hr_uc, self.cached_uc], self.hr_extra_network_data)
+        self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, self.hr_prompts, self.steps * self.step_multiplier, [self.cached_hr_c, self.cached_c], self.hr_extra_network_data)
+
     def setup_conds(self):
         super().setup_conds()
 
+        self.hr_uc = None
+        self.hr_c = None
+
         if self.enable_hr:
-            self.hr_uc = self.get_conds_with_caching(prompt_parser.get_learned_conditioning, self.hr_negative_prompts, self.steps * self.step_multiplier, self.cached_uc, self.hr_extra_network_data)
-            self.hr_c = self.get_conds_with_caching(prompt_parser.get_multicond_learned_conditioning, self.hr_prompts, self.steps * self.step_multiplier, self.cached_c, self.hr_extra_network_data)
+            if shared.opts.hires_fix_use_firstpass_conds:
+                self.calculate_hr_conds()
+
+            elif lowvram.is_enabled(shared.sd_model):  # if in lowvram mode, we need to calculate conds right away, before the cond NN is unloaded
+                with devices.autocast():
+                    extra_networks.activate(self, self.hr_extra_network_data)
+
+                self.calculate_hr_conds()
+
+                with devices.autocast():
+                    extra_networks.activate(self, self.extra_network_data)
 
     def parse_extra_network_prompts(self):
         res = super().parse_extra_network_prompts()
