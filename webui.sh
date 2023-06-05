@@ -94,6 +94,14 @@ else
     printf "\n%s\n" "${delimiter}"
 fi
 
+if [[ $(getconf LONG_BIT) = 32 ]]
+then
+    printf "\n%s\n" "${delimiter}"
+    printf "\e[1m\e[31mERROR: Unsupported Running on a 32bit OS\e[0m"
+    printf "\n%s\n" "${delimiter}"
+    exit 1
+fi
+
 if [[ -d .git ]]
 then
     printf "\n%s\n" "${delimiter}"
@@ -104,7 +112,7 @@ then
 fi
 
 # Check prerequisites
-gpu_info=$(lspci 2>/dev/null | grep VGA)
+gpu_info=$(lspci 2>/dev/null | grep -E "VGA|Display")
 case "$gpu_info" in
     *"Navi 1"*|*"Navi 2"*) export HSA_OVERRIDE_GFX_VERSION=10.3.0
     ;;
@@ -116,11 +124,13 @@ case "$gpu_info" in
     *)
     ;;
 esac
-if echo "$gpu_info" | grep -q "AMD" && [[ -z "${TORCH_COMMAND}" ]]
+if ! echo "$gpu_info" | grep -q "NVIDIA";
 then
-    # AMD users will still use torch 1.13 because 2.0 does not seem to work.
-    export TORCH_COMMAND="pip install torch==1.13.1+rocm5.2 torchvision==0.14.1+rocm5.2 --index-url https://download.pytorch.org/whl/rocm5.2"
-fi  
+    if echo "$gpu_info" | grep -q "AMD" && [[ -z "${TORCH_COMMAND}" ]]
+    then
+        export TORCH_COMMAND="pip install torch==2.0.1+rocm5.4.2 torchvision==0.15.2+rocm5.4.2 --index-url https://download.pytorch.org/whl/rocm5.4.2"
+    fi
+fi
 
 for preq in "${GIT}" "${python_cmd}"
 do
@@ -153,30 +163,37 @@ else
     cd "${clone_dir}"/ || { printf "\e[1m\e[31mERROR: Can't cd to %s/%s/, aborting...\e[0m" "${install_dir}" "${clone_dir}"; exit 1; }
 fi
 
-printf "\n%s\n" "${delimiter}"
-printf "Create and activate python venv"
-printf "\n%s\n" "${delimiter}"
-cd "${install_dir}"/"${clone_dir}"/ || { printf "\e[1m\e[31mERROR: Can't cd to %s/%s/, aborting...\e[0m" "${install_dir}" "${clone_dir}"; exit 1; }
-if [[ ! -d "${venv_dir}" ]]
+if [[ -z "${VIRTUAL_ENV}" ]];
 then
-    "${python_cmd}" -m venv "${venv_dir}"
-    first_launch=1
-fi
-# shellcheck source=/dev/null
-if [[ -f "${venv_dir}"/bin/activate ]]
-then
-    source "${venv_dir}"/bin/activate
+    printf "\n%s\n" "${delimiter}"
+    printf "Create and activate python venv"
+    printf "\n%s\n" "${delimiter}"
+    cd "${install_dir}"/"${clone_dir}"/ || { printf "\e[1m\e[31mERROR: Can't cd to %s/%s/, aborting...\e[0m" "${install_dir}" "${clone_dir}"; exit 1; }
+    if [[ ! -d "${venv_dir}" ]]
+    then
+        "${python_cmd}" -m venv "${venv_dir}"
+        first_launch=1
+    fi
+    # shellcheck source=/dev/null
+    if [[ -f "${venv_dir}"/bin/activate ]]
+    then
+        source "${venv_dir}"/bin/activate
+    else
+        printf "\n%s\n" "${delimiter}"
+        printf "\e[1m\e[31mERROR: Cannot activate python venv, aborting...\e[0m"
+        printf "\n%s\n" "${delimiter}"
+        exit 1
+    fi
 else
     printf "\n%s\n" "${delimiter}"
-    printf "\e[1m\e[31mERROR: Cannot activate python venv, aborting...\e[0m"
+    printf "python venv already activate: ${VIRTUAL_ENV}"
     printf "\n%s\n" "${delimiter}"
-    exit 1
 fi
 
 # Try using TCMalloc on Linux
 prepare_tcmalloc() {
     if [[ "${OSTYPE}" == "linux"* ]] && [[ -z "${NO_TCMALLOC}" ]] && [[ -z "${LD_PRELOAD}" ]]; then
-        TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
+        TCMALLOC="$(PATH=/usr/sbin:$PATH ldconfig -p | grep -Po "libtcmalloc(_minimal|)\.so\.\d" | head -n 1)"
         if [[ ! -z "${TCMALLOC}" ]]; then
             echo "Using TCMalloc: ${TCMALLOC}"
             export LD_PRELOAD="${TCMALLOC}"
